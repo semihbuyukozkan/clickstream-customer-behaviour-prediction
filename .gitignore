@@ -33,9 +33,5 @@ events.out.tfevents.*
 saved_model/
 
 # Çıktı ve görselleştirme dosyaları
-results/
-plots/
-dataset/item_properties_part1.csv
-dataset/item_properties_part2.csv
 dataset/events.csv
 dataset/features.csv
