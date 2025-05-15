@@ -1,0 +1,41 @@
+# Sanal ortamlar
+.venv/
+venv/
+ENV/
+env/
+.venv1/
+
+# Derlenmiş Python dosyaları
+__pycache__/
+*.py[cod]
+*.so
+
+# Jupyter Notebook kontrol dosyaları
+*.ipynb_checkpoints/
+
+# IDE dosyaları
+.idea/
+.vscode/
+
+# macOS sistem dosyaları
+.DS_Store
+
+# TensorBoard log dosyaları
+logs/
+events.out.tfevents.*
+
+# Model ve ağırlık dosyaları
+*.h5
+*.keras
+*.pb
+
+# Kayıtlı modeller
+saved_model/
+
+# Çıktı ve görselleştirme dosyaları
+results/
+plots/
+dataset/item_properties_part1.csv
+dataset/item_properties_part2.csv
+dataset/events.csv
+dataset/features.csv
