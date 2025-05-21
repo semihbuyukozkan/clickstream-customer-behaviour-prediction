@@ -1,81 +1,64 @@
 import pandas as pd
 import numpy as np
+from tensorflow.keras.preprocessing.sequence import pad_sequences
+import os
 
-events = pd.read_csv("dataset/events.csv")
-events['timestamp'] = pd.to_datetime(events['timestamp'], unit='ms')
+# Klasör yolları
+RAW_DATA_PATH = "dataset/events.csv"
+OUTPUT_DIR = "prepared"
 
-events_sorted = events.sort_values(by=['visitorid', 'timestamp'])
+# 1. Veriyi yükle ve zaman damgasını dönüştür
+df = pd.read_csv(RAW_DATA_PATH)
+df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
+df = df.sort_values(["visitorid", "timestamp"])
 
-events_sorted['session_id'] = (
-    (events_sorted.groupby('visitorid')['timestamp'].diff() >= pd.Timedelta(minutes=30))
-    .fillna(True)
-    .astype(int)
-    .groupby(events_sorted['visitorid']).cumsum()
-    .astype(str)
-)
+print("Veriyi yükle ve zaman damgasını dönüştür")
+# 2. Event kodlama (view=0, addtocart=1, transaction=2)
+event_map = {"view": 0, "addtocart": 1, "transaction": 2}
+df["event_code"] = df["event"].map(event_map)
+print("")
+# 3. 30 dakikalık boşlukla oturum oluştur
+df["session_number"] = df.groupby("visitorid")["timestamp"].transform(lambda x: x.diff().gt("30min").cumsum())
+df["session_id"] = df["visitorid"].astype(str) + "_" + df["session_number"].astype(str)
+print("30 dakikalık boşlukla oturum oluştur")
+# 4. Label: Oturumda transaction varsa 1, yoksa 0
+session_labels = df.groupby("session_id")["event"].apply(lambda x: int("transaction" in x.values))
+print(" Label: Oturumda transaction varsa 1, yoksa 0")
+# 5. Input'tan transaction event'lerini çıkar
+df_inputs = df[df["event"] != "transaction"]
 
-events_sorted['session_id'] = (
-    events_sorted['visitorid'].astype(str) + "_" + events_sorted['session_id']
-)
+# 6. Oturumlara göre event_code listesi oluştur
+session_sequences = df_inputs.groupby("session_id")["event_code"].apply(list)
+print("Oturumlara göre event_code listesi oluştur")
+# 7. Padding için optimal maxlen belirleme
+lengths = session_sequences.apply(len)
+maxlen = int(np.percentile(lengths, 95))  # %95'lik oturum uzunluğu
+print(f"Padding için kullanılacak maxlen: {maxlen}")
 
-session_labels = events_sorted.groupby('session_id')['event'].apply(lambda x: int('transaction' in x.values))
-events_sorted = events_sorted.merge(session_labels.rename("purchase"), on="session_id")
+# 8. Çok uzun oturumları kes ve daha kısa olanları pad et
+padded_sequences = pad_sequences(session_sequences.values, maxlen=maxlen, padding="post", truncating="post")
 
-#print(events_sorted[['session_id', 'purchase']].drop_duplicates()['purchase'].value_counts())
+# 9. Label'ları hizala
+labels = session_labels.loc[session_sequences.index].values
 
-#FEATURE ENGINEERING
+# 10. Zaman bazlı sıralama ve train/test ayrımı
+session_times = df.groupby("session_id")["timestamp"].min()
+sorted_sessions = session_times.loc[session_sequences.index].sort_values().index
 
-events_filtered = events_sorted[events_sorted['event'].isin(['view', 'addtocart'])]
+split_idx = int(len(sorted_sessions) * 0.8)
+train_ids = sorted_sessions[:split_idx]
+test_ids = sorted_sessions[split_idx:]
 
-# Yeni total_events
-total_events = events_filtered.groupby('session_id').size().rename('total_events')
+X_train = padded_sequences[np.isin(session_sequences.index, train_ids)]
+y_train = labels[np.isin(session_sequences.index, train_ids)]
+X_test = padded_sequences[np.isin(session_sequences.index, test_ids)]
+y_test = labels[np.isin(session_sequences.index, test_ids)]
+print("Zaman bazlı sıralama ve train/test ayrımı")
+# 11. Kayıt işlemi
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+np.save(f"{OUTPUT_DIR}/X_train.npy", X_train)
+np.save(f"{OUTPUT_DIR}/y_train.npy", y_train)
+np.save(f"{OUTPUT_DIR}/X_test.npy", X_test)
+np.save(f"{OUTPUT_DIR}/y_test.npy", y_test)
 
-# Diğer feature'lar da bu events_filtered üzerinden hesaplanmalı (data leak'e engel olmak için)
-# 2. View event sayısı
-num_views = events_sorted[events_sorted['event'] == 'view'].groupby('session_id').size().rename('num_views')
-
-# 3. Addtocart event sayısı
-num_addtocarts = events_sorted[events_sorted['event'] == 'addtocart'].groupby('session_id').size().rename('num_addtocarts')
-
-# 4. Unique item sayısı (kaç farklı ürün görüldü)
-unique_items_viewed = events_sorted.groupby('session_id')['itemid'].nunique().rename('unique_items_viewed')
-
-# 5. Oturum süresi (son - ilk timestamp, saniye cinsinden)
-session_duration = events_filtered.groupby('session_id')['timestamp'].agg(
-    lambda x: (x.max() - x.min()).total_seconds() if len(x) > 1 else 0
-).rename('session_duration')
-
-# 6. View to cart ratio
-view_to_cart_ratio = (num_addtocarts / num_views).replace([np.inf, np.nan], 0).rename('view_to_cart_ratio')
-
-# 7. Cart occurred (binary 0/1 olarak sepete ürün eklenmiş mi?)
-cart_occurred = (num_addtocarts > 0).astype(int).rename('cart_occurred')
-
-# 8. Last event type (oturumun sonundaki event tipi)
-last_event_type = events_sorted.groupby('session_id')['event'].last().rename('last_event_type')
-
-# 9. Hedef değişken (purchase)
-purchase = events_sorted.drop_duplicates('session_id')[['session_id', 'purchase']].set_index('session_id')['purchase']
-
-features = pd.concat([
-    total_events,
-    num_views,
-    num_addtocarts,
-    unique_items_viewed,
-    session_duration,
-    view_to_cart_ratio,
-    cart_occurred,
-    last_event_type,
-    purchase
-], axis=1).fillna(0)
-
-
-features['num_views'] = features['num_views'].astype(int)
-features['num_addtocarts'] = features['num_addtocarts'].astype(int)
-features['unique_items_viewed'] = features['unique_items_viewed'].astype(int)
-features['cart_occurred'] = features['cart_occurred'].astype(int)
-features['purchase'] = features['purchase'].astype(int)
-
-
-
-features.to_csv("dataset/features.csv", index=True)
+print("Preprocessing tamamlandı ve dosyalar saved/prepared klasörüne kaydedildi.")

@@ -1,78 +1,111 @@
-import pandas as pd
 import numpy as np
-from sklearn.model_selection import train_test_split
-from sklearn.utils.class_weight import compute_class_weight
-from sklearn.metrics import classification_report, confusion_matrix, roc_auc_score
+import tensorflow as tf
 from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import LSTM, Dense, Embedding
-from tensorflow.keras.preprocessing.sequence import pad_sequences
-from tensorflow.keras.callbacks import EarlyStopping
-from tensorflow.keras.optimizers.legacy import Adam
-from tensorflow.keras.metrics import AUC
-from tensorflow.keras import mixed_precision
+from tensorflow.keras.layers import LSTM, Dense, Masking, Dropout
+from sklearn.metrics import classification_report, precision_recall_curve, PrecisionRecallDisplay
+import matplotlib.pyplot as plt
 
-# 0. Mixed Precision Ayarı
-#mixed_precision.set_global_policy('mixed_float16')
+# GPU kontrolü ve bellek optimizasyonu
+gpus = tf.config.list_physical_devices('GPU')
+if gpus:
+    print(f"✅ GPU kullanılıyor: {gpus[0].name}")
+    tf.config.experimental.set_memory_growth(gpus[0], True)
+else:
+    print("❌ GPU bulunamadı.")
 
-# 1. Veri Yükleme
-events = pd.read_csv("dataset/events.csv")
-events['timestamp'] = pd.to_datetime(events['timestamp'], unit='ms')
-events = events.sort_values(['visitorid', 'timestamp'])
+# Veri yükleme
+X_train = np.load("prepared/X_train.npy")
+y_train = np.load("prepared/y_train.npy")
+X_test = np.load("prepared/X_test.npy")
+y_test = np.load("prepared/y_test.npy")
 
-# 2. Oturum Belirleme (Optimize edilmiş versiyon)
-events['session_number'] = (
-    events.groupby('visitorid')['timestamp']
-    .transform(lambda x: x.diff().gt('30min').cumsum())
-)
-events['session_id'] = events['visitorid'].astype(str) + "_" + events['session_number'].astype(str)
-
-# 3. Event Kodlama
-event_mapping = {'view': 0, 'addtocart': 1, 'transaction': 2}
-events['event_code'] = events['event'].map(event_mapping)
-sequences = events.groupby('session_id')['event_code'].apply(list)
-labels = events.groupby('session_id').apply(lambda x: 1 if x['event'].iloc[-1] == 'transaction' else 0)
-
-# 4. Padding ve Split
-X = pad_sequences(sequences, padding='pre', maxlen=30).astype(np.int32)
-y = np.array(labels)
-X_train, X_test, y_train, y_test = train_test_split(X, y, stratify=y, test_size=0.2, random_state=42)
-
-# 5. Class Weights
-weights = compute_class_weight(class_weight='balanced', classes=np.unique(y_train), y=y_train)
-class_weight_dict = {i: w for i, w in enumerate(weights)}
-
-# 6. Model Tanımı
+# Model Mimarisi
 model = Sequential([
-    Embedding(input_dim=3, output_dim=4, input_length=30, mask_zero=True),
-    LSTM(8),
-    Dense(1, activation='sigmoid', dtype='float32')  # float16 yerine float32 çıkış
+    Masking(mask_value=0.0, input_shape=(X_train.shape[1],)),
+    tf.keras.layers.Embedding(input_dim=3, output_dim=16),
+    LSTM(64, return_sequences=True, dropout=0.3, recurrent_dropout=0.3),
+    Dropout(0.4),
+    LSTM(32, dropout=0.2, recurrent_dropout=0.2),
+    Dense(1, activation='sigmoid')
 ])
 
-model.compile(
-    optimizer=Adam(learning_rate=0.001),
-    loss='binary_crossentropy',
-    metrics=['accuracy', AUC(name='auc')]
+# Optimize edilmiş hiperparametreler
+optimizer = tf.keras.optimizers.Adam(
+    learning_rate=0.0001,
+    clipnorm=1.0
 )
 
-# 7. EarlyStopping
-early_stop = EarlyStopping(monitor='val_auc', mode='max', patience=3, restore_best_weights=True)
+model.compile(
+    loss='binary_crossentropy',
+    optimizer=optimizer,
+    metrics=[
+        'accuracy',
+        tf.keras.metrics.Precision(name='precision'),
+        tf.keras.metrics.Recall(name='recall'),
+        tf.keras.metrics.AUC(name='auc')
+    ]
+)
 
-# 8. Eğitim
+model.summary()
+
+# Sınıf ağırlıklarını hesapla
+class_weights = {0: 1, 1: 20}  # Pozitif sınıfa 20x ağırlık
+print(f"\n⚠️ Sınıf Ağırlıkları: {class_weights}")
+
+# Early Stopping (Precision odaklı)
+early_stop = tf.keras.callbacks.EarlyStopping(
+    monitor='val_precision',
+    patience=5,
+    mode='max',
+    restore_best_weights=True
+)
+
+# Model eğitimi
 history = model.fit(
     X_train, y_train,
-    validation_split=0.15,
     epochs=15,
     batch_size=1024,
-    class_weight=class_weight_dict,
+    validation_split=0.2,
+    class_weight=class_weights,
     callbacks=[early_stop],
-    verbose=1
+    verbose=2
 )
 
-# 9. Değerlendirme
+# Threshold optimizasyonu
 y_pred_probs = model.predict(X_test).flatten()
-y_pred = (y_pred_probs > 0.5).astype(int)
+precision, recall, thresholds = precision_recall_curve(y_test, y_pred_probs)
+f1_scores = 2 * (precision * recall) / (precision + recall + 1e-9)
+best_threshold = thresholds[np.argmax(f1_scores)]
+y_pred = (y_pred_probs > best_threshold).astype(int)
 
-print("## PERFORMANCE REPORT ##")
-print("Confusion Matrix:\n", confusion_matrix(y_test, y_pred))
-print("\nClassification Report:\n", classification_report(y_test, y_pred, digits=4))
-print("ROC AUC Score:", roc_auc_score(y_test, y_pred_probs))
+# Detaylı performans raporu
+print("\n📊 Detaylı Performans Raporu:")
+print(classification_report(y_test, y_pred, digits=4))
+
+# Precision-Recall Eğrisi
+plt.figure(figsize=(10, 6))
+PrecisionRecallDisplay.from_predictions(y_test, y_pred_probs, name="LSTM Modeli")
+plt.title("Doğruluk-Duyarlılık Eğrisi", fontsize=13)
+plt.xlabel("Pozitif Öngörü Oranı (Precision)", fontsize=11)
+plt.ylabel("Gerçek Pozitif Oranı (Recall)", fontsize=11)
+plt.plot([0, 1], [0.5, 0.5], linestyle='--', label='Baz Model')
+plt.legend(loc="lower right", fontsize=10)
+plt.grid(True)
+plt.show()
+
+# Eğitim Geçmişi Görselleştirme
+plt.figure(figsize=(12, 5))
+plt.subplot(1, 2, 1)
+plt.plot(history.history['loss'], label='Eğitim Kaybı')
+plt.plot(history.history['val_loss'], label='Doğrulama Kaybı')
+plt.title('Kayıp (loss) Trendi')
+plt.legend()
+
+plt.subplot(1, 2, 2)
+plt.plot(history.history['precision'], label='Eğitim Kesinliği')
+plt.plot(history.history['val_precision'], label='Doğrulama Kesinliği')
+plt.title('Kesinlik (presicion) Trendi')
+plt.legend()
+
+plt.tight_layout()
+plt.show()
